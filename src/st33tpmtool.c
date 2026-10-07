@@ -173,41 +173,119 @@ static int ch341_stream(unsigned length, unsigned char *buf, void *ctx)
     return 1;
 }
 
-/* DLL candidates: the 64-bit library must be used by this 64-bit exe.
- * WCH ships two parallel files:  CH341DLL.dll (32-bit) and
- * CH341DLLA64.dll (64-bit).  Loading the 32-bit one from a 64-bit process
- * fails with ERROR_BAD_EXE_FORMAT -- so try the A64 variant first.          */
-static HMODULE try_load_dll(const char *name, DWORD *err)
+/* ============================================================================
+ *  DLL discovery by CONTENT (not by filename)
+ *  This exe is 64-bit. WCH ships several similarly-named libraries:
+ *    CH341DLL.dll     (32-bit)  -> fails with error 193 here
+ *    CH341DLLA64.dll  (64-bit)  -> the one we want (SPI functions)
+ *    CH341PORTS*.dll  (64-bit)  -> serial-port helper, NO SPI exports
+ *  So: load candidate DLLs and keep the first that actually exports
+ *  CH341OpenDevice + CH341StreamSPI4. Searched locations:
+ *    1) the exe's own folder        ("next to the app" wins)
+ *    2) known CH341A Pro install folders
+ *    3) System32 via plain name lookup (driver installs live there)
+ *  Manual override: --dll <full path>
+ * ========================================================================== */
+#include <shlwapi.h>
+
+static HMODULE dll_try_path(const char *path, DWORD *err)
 {
-    char     path[MAX_PATH];
-    char     self[MAX_PATH];
-    char    *slash;
-    HMODULE  m;
-    GetModuleFileNameA(NULL, self, sizeof(self));
-    slash = strrchr(self, '\\');
-    if (slash) *(slash + 1) = 0;
-    _snprintf(path, sizeof(path) - 1, "%s%s", self, name);
-    m = LoadLibraryA(path);
-    if (m) return m;
-    *err = GetLastError();
-    m = LoadLibraryA(name);      /* system path fallback (System32, PATH) */
-    if (m) return m;
+    HMODULE m = LoadLibraryExA(path, NULL, LOAD_WITH_ALTERED_SEARCH_PATH);
+    if (!m) { *err = GetLastError(); return NULL; }
+    {
+        void *a = (void *)GetProcAddress(m, "CH341OpenDevice");
+        void *b = (void *)GetProcAddress(m, "CH341StreamSPI4");
+        if (a && b) return m;                    /* correct SPI library       */
+    }
+    FreeLibrary(m);
     return NULL;
 }
 
+static HMODULE dll_from_dir(const char *dir, const char *pattern, DWORD *err)
+{
+    char fspec[MAX_PATH], full[MAX_PATH];
+    WIN32_FIND_DATAA fd;
+    HANDLE fh;
+    int k;
+    for (k = 0; dir[k] && k < MAX_PATH - 2; ++k) fspec[k] = dir[k];
+    fspec[k] = 0;
+    if (k && dir[k-1] != '\\') fspec[k++] = '\\';
+    fspec[k] = 0;
+    _snprintf(fspec + k, sizeof(fspec) - (size_t)k - 1, "%s", pattern);
+    fh = FindFirstFileA(fspec, &fd);
+    if (fh == INVALID_HANDLE_VALUE) return NULL;
+    do {
+        HMODULE m;
+        unsigned p = 0;
+        while (dir[p] && p < MAX_PATH - 2) { full[p] = dir[p]; ++p; }
+        if (p && dir[p-1] != '\\') full[p++] = '\\';
+        {
+            unsigned q = 0;
+            while (fd.cFileName[q] && p + q < MAX_PATH - 1) { full[p + q] = fd.cFileName[q]; ++q; }
+            full[p + q] = 0;
+        }
+        m = dll_try_path(full, err);
+        if (m) { FindClose(fh); return m; }
+    } while (FindNextFileA(fh, &fd));
+    FindClose(fh);
+    return NULL;
+}
+
+static HMODULE find_ch341_dll(const char *override, DWORD *err)
+{
+    char self[MAX_PATH], dir[MAX_PATH], *slash;
+    HMODULE m;
+    static const char *install_dirs[] = {
+        "C:\\Program Files\\CH341A Pro",
+        "C:\\Program Files (x86)\\CH341A Pro",
+        "C:\\Program Files\\CH341PAR",
+        NULL
+    };
+    int i;
+    if (override && *override) {
+        m = dll_try_path(override, err);
+        if (!m) emit("ERROR: --dll %s: LoadLibrary or exports check failed", override);
+        return m;
+    }
+    GetModuleFileNameA(NULL, self, sizeof(self));
+    slash = strrchr(self, '\\');
+    if (slash) { *slash = 0; strcpy_s(dir, sizeof(dir), self); }
+    else dir[0] = 0;
+
+    m = dll_from_dir(dir, "*.dll", err);                 /* next to the app  */
+    if (m) return m;
+    for (i = 0; install_dirs[i]; ++i) {                  /* Pro install dirs */
+        m = dll_from_dir(install_dirs[i], "CH341*.dll", err);
+        if (m) { emit("DLL found in: %s", install_dirs[i]); return m; }
+    }
+    m = LoadLibraryA("CH341DLLA64.dll");                 /* System32         */
+    if (!m) m = LoadLibraryA("CH341DLL.dll");
+    if (m) {
+        void *a = (void *)GetProcAddress(m, "CH341OpenDevice");
+        void *b = (void *)GetProcAddress(m, "CH341StreamSPI4");
+        if (a && b) return m;
+        FreeLibrary(m);
+    }
+    return NULL;
+}
+
+static int ch341_open_ext(Ch341 *c, unsigned index, const char *dll_override);
 static int ch341_open(Ch341 *c, unsigned index)
+{ return ch341_open_ext(c, index, NULL); }
+
+static int ch341_open_ext(Ch341 *c, unsigned index, const char *dll_override)
 {
     DWORD err = 0;
     memset(c, 0, sizeof(*c));
-    c->dll = try_load_dll("CH341DLLA64.dll", &err);
-    if (!c->dll) c->dll = try_load_dll("CH341DLL.dll", &err);
+    c->dll = find_ch341_dll(dll_override, &err);
     if (!c->dll) {
         if (err == 193 /* ERROR_BAD_EXE_FORMAT */) {
-            emit("ERROR: the CH341 DLL next to the app is 32-bit, this exe is 64-bit.");
-            emit("Place CH341DLLA64.dll (the 64-bit WCH library) next to the app");
-            emit("instead. It ships inside the CH341PAR driver package.");
+            emit("ERROR: found a CH341 DLL but it is 32-bit; this exe is 64-bit.");
         } else {
-            emit("ERROR: neither CH341DLLA64.dll nor CH341DLL.dll could be found.");
+            emit("ERROR: no DLL exporting CH341OpenDevice+CH341StreamSPI4 was found.");
+            emit("HINT: CH341PORTS*.dll (the serial-port helper) does NOT contain");
+            emit("the SPI functions. The SPI library is CH341DLLA64.dll, shipped");
+            emit("inside the WCH CH341PAR driver package.");
             emit("  1) If you have CH341A Pro installed on this PC, copy CH341DLL.dll");
             emit("     from its install folder (e.g. C:\\Program Files\\CH341A Pro\\)");
             emit("  2) Otherwise install the WCH CH341PAR driver package (that one");
@@ -877,6 +955,7 @@ typedef struct {
 } App;
 
 static App g_app;
+static const char *g_dll_override = NULL;
 static unsigned g_sim_mode = SIM_MODE_HEALTHY;
 static int  g_gui_sim = 0;
 static HWND g_hwnd = NULL;
@@ -1005,7 +1084,7 @@ static LRESULT CALLBACK main_wndproc(HWND h, UINT m, WPARAM wp, LPARAM lp)
                 emit("simulator backend already active");
             } else {
                 char idx[12]; GetDlgItemTextA(h, IDC_DEVICEIDX, idx, sizeof(idx));
-                ch341_open(&g_app.ch341, (unsigned)atoi(idx));
+                ch341_open_ext(&g_app.ch341, (unsigned)atoi(idx), NULL);
                 g_app.open_ok = 1;
             }
             return 0;
@@ -1151,6 +1230,7 @@ int WINAPI WinMain(HINSTANCE hI, HINSTANCE hP, LPSTR cl, int nShow)
             }
         }
         else if (!strcmp(argv[i], "--verbose")) g_verbose = 1;
+        else if (!strcmp(argv[i], "--dll") && i + 1 < nargc) g_dll_override = argv[++i];
     }
 
     /* GUI subsystem has no console of its own. When running in CLI mode from a
