@@ -778,11 +778,70 @@ static int cli_driver(void)
 
 
 /* ------------------------------------------------------------- CLI actions */
+
+/* MISO-signature classifier: performs one privileged read of DID_VID and
+ * classifies what the data line actually does, so the failure text can
+ * diagnose wiring (floating-high vs tied-low vs inconsistent).            */
+#define MISO_FLOAT_HIGH   1
+#define MISO_TIED_LOW     2
+#define MISO_ACTIVE       0
+
+static int miso_signature(Transport *t)
+{
+    size_t fillers = 40, n = 4;
+    unsigned char buf[4 + 260];
+    unsigned i;
+    int any_low = 0, any_high = 0;
+
+    memset(buf, 0, sizeof(buf));
+    buf[0] = 0x80u | ((unsigned char)(n - 1) & 0x3F);
+    buf[1] = 0xD4;
+    buf[2] = (unsigned char)((REG_DID_VID >> 8) & 0xFF);
+    buf[3] = (unsigned char)(REG_DID_VID & 0xFF);
+    (void)fillers;
+    /* one raw stream */
+    {
+        unsigned char *sbuf = (unsigned char *)calloc(4 + 48, 1);
+        if (!sbuf) return MISO_ACTIVE;
+        memcpy(sbuf, buf, 4);
+        if (!t->stream(4 + 48, sbuf, t->ctx)) { free(sbuf); return MISO_ACTIVE; }
+        dump_hex("miso frame", sbuf, 4 + 48);
+        for (i = 4; i < 4 + 48; ++i) {
+            if (sbuf[i] == 0x00) any_low = 1;
+            if (sbuf[i] == 0xFF) any_high = 1;
+        }
+        free(sbuf);
+    }
+    if (any_high && !any_low) return MISO_FLOAT_HIGH;
+    if (any_low && !any_high) return MISO_TIED_LOW;
+    return MISO_ACTIVE;
+}
+
+static void emit_bench_checklist(int miso)
+{
+    emit("");
+    emit("CHEAT-SHEET for this state:");
+    if (miso == MISO_FLOAT_HIGH)
+        emit("  MISO reads 0xFF (floating high) - nobody drives the data line:");
+    else if (miso == MISO_TIED_LOW)
+        emit("  MISO reads 0x00 (tied low) - the data line is parked/shorted:");
+    else
+        emit("  irregular bus activity - borderline wiring?");
+    emit("   a) SWAP MOSI and MISO wires at the ZIF (very common miswiring");
+    emit("      on CH341A Pro boards labelled for memory programming)");
+    emit("   b) measure 3.3 V AT U32 pin 22 right now - with the battery out");
+    emit("      the standby rail is dead unless your bench supply feeds it");
+    emit("   c) continuity: U32 pin 24 (chip SO) -> CH341A MISO; the chip side");
+    emit("      of RE133 (= U32 pin 20) -> CH341A CS0");
+    emit("");
+}
+
 static void cli_info(Transport *t)
 {
     unsigned vid = 0, did = 0, rid = 0;
     if (probe_chip(t, &vid, &did, &rid)) {
         emit("no chip response - bus floating / chip not addressed");
+        emit_bench_checklist(miso_signature(t));
         return;
     }
     emit("VID=0x%04X  DID=0x%04X   (%s)", vid, did, vid_name(vid));
