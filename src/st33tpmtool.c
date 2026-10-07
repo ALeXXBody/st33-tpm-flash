@@ -997,7 +997,6 @@ static LRESULT CALLBACK main_wndproc(HWND h, UINT m, WPARAM wp, LPARAM lp)
         lf.lfHeight = -14;
         strcpy_s(lf.lfFaceName, sizeof(lf.lfFaceName), "MS Shell Dlg");
         g_fnt = CreateFontIndirectA(&lf);
-        g_logbox = GetDlgItem(h, IDC_LOGB);      /* route emit() output into the UI log */
         if (g_gui_sim)
             SendMessageA(GetDlgItem(h, IDC_SIMMODE), BM_SETCHECK, (WPARAM)BST_CHECKED, 0);
 
@@ -1068,6 +1067,12 @@ static LRESULT CALLBACK main_wndproc(HWND h, UINT m, WPARAM wp, LPARAM lp)
 
         /* apply fonts */
         EnumChildWindows(h, setfont_proc, 0);
+
+        /* NOW the log control exists - bind it and greet */
+        g_logbox = GetDlgItem(h, IDC_LOGB);
+        emit("st33tpmtool ready. Pick a backend below and press the buttons:");
+        emit("  * 'Demo: run simulator instead' - rehearse with no hardware");
+        emit("  * 'Open' - attach the CH341A and use Probe/Status/Caps.");
         return 0;
     }
 
@@ -1096,13 +1101,14 @@ static LRESULT CALLBACK main_wndproc(HWND h, UINT m, WPARAM wp, LPARAM lp)
             return 0;
 
         case IDC_PROBE: {
-            unsigned char b[8];
-            unsigned vid, did;
-            ptp_read(&g_app.tport, REG_DID_VID, b, 4);
-            vid = ((unsigned)b[0] << 8) | b[1];
-            did = ((unsigned)b[2] << 8) | b[3];
-            SetDlgItemTextA(h, IDC_CHIPINFO, vid_name(vid));
-            emit("probe: VID=0x%04X DID=0x%04X (%s)", vid, did, vid_name(vid));
+            unsigned vid = 0, did = 0, rid = 0;
+            if (probe_chip(&g_app.tport, &vid, &did, &rid)) {
+                SetDlgItemTextA(h, IDC_CHIPINFO, "(no chip)");
+                emit("probe: no chip response - bus floating / chip not addressed");
+            } else {
+                SetDlgItemTextA(h, IDC_CHIPINFO, vid_name(vid));
+                emit("probe: VID=0x%04X DID=0x%04X RID=0x%02X (%s)", vid, did, rid, vid_name(vid));
+            }
             return 0;
         }
 
