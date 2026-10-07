@@ -173,18 +173,47 @@ static int ch341_stream(unsigned length, unsigned char *buf, void *ctx)
     return 1;
 }
 
+/* DLL candidates: the 64-bit library must be used by this 64-bit exe.
+ * WCH ships two parallel files:  CH341DLL.dll (32-bit) and
+ * CH341DLLA64.dll (64-bit).  Loading the 32-bit one from a 64-bit process
+ * fails with ERROR_BAD_EXE_FORMAT -- so try the A64 variant first.          */
+static HMODULE try_load_dll(const char *name, DWORD *err)
+{
+    char     path[MAX_PATH];
+    char     self[MAX_PATH];
+    char    *slash;
+    HMODULE  m;
+    GetModuleFileNameA(NULL, self, sizeof(self));
+    slash = strrchr(self, '\\');
+    if (slash) *(slash + 1) = 0;
+    _snprintf(path, sizeof(path) - 1, "%s%s", self, name);
+    m = LoadLibraryA(path);
+    if (m) return m;
+    *err = GetLastError();
+    m = LoadLibraryA(name);      /* system path fallback (System32, PATH) */
+    if (m) return m;
+    return NULL;
+}
+
 static int ch341_open(Ch341 *c, unsigned index)
 {
+    DWORD err = 0;
     memset(c, 0, sizeof(*c));
-    c->dll = LoadLibraryA("CH341DLL.dll");
-    if (!c->dll) c->dll = LoadLibraryA("CH341DLL");
+    c->dll = try_load_dll("CH341DLLA64.dll", &err);
+    if (!c->dll) c->dll = try_load_dll("CH341DLL.dll", &err);
     if (!c->dll) {
-        emit("ERROR: CH341DLL.dll not found next to the app.");
-        emit("  1) If you have CH341A Pro installed on this PC, copy CH341DLL.dll");
-        emit("     from its install folder (e.g. C:\\Program Files\\CH341A Pro\\)");
-        emit("  2) Otherwise install the WCH CH341PAR driver package (that one");
-        emit("     exposes the SPI functions and includes CH341DLL.dll).");
-        emit("     NOTE: the CH341SER driver (COM port) alone is NOT enough.");
+        if (err == 193 /* ERROR_BAD_EXE_FORMAT */) {
+            emit("ERROR: the CH341 DLL next to the app is 32-bit, this exe is 64-bit.");
+            emit("Place CH341DLLA64.dll (the 64-bit WCH library) next to the app");
+            emit("instead. It ships inside the CH341PAR driver package.");
+        } else {
+            emit("ERROR: neither CH341DLLA64.dll nor CH341DLL.dll could be found.");
+            emit("  1) If you have CH341A Pro installed on this PC, copy CH341DLL.dll");
+            emit("     from its install folder (e.g. C:\\Program Files\\CH341A Pro\\)");
+            emit("  2) Otherwise install the WCH CH341PAR driver package (that one");
+            emit("     exposes the SPI functions and includes CH341DLL.dll).");
+            emit("     NOTE: the CH341SER driver (COM port) alone is NOT enough.");
+        }
         return 0;
     }
     c->open        = (ch3_open_t)        GetProcAddress(c->dll, "CH341OpenDevice");
