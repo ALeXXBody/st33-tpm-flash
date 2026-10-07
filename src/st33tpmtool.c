@@ -804,7 +804,7 @@ static LRESULT CALLBACK main_wndproc(HWND h, UINT m, WPARAM wp, LPARAM lp)
 
         memset(&lf, 0, sizeof(lf));
         lf.lfHeight = -14;
-        strcpy_s(lf.lfFaceName, sizeof(lf.lfFaceName), "Segoe UI");
+        strcpy_s(lf.lfFaceName, sizeof(lf.lfFaceName), "MS Shell Dlg");
         g_fnt = CreateFontIndirectA(&lf);
         g_logbox = GetDlgItem(h, IDC_LOGB);      /* route emit() output into the UI log */
         if (g_gui_sim)
