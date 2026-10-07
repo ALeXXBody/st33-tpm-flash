@@ -33,6 +33,8 @@
 #include <stdint.h>
 
 /* --------------------------------------------------------------- constants */
+#define APP_VERSION         "1.0.6"
+
 #define MAX_SPI_FRAMESIZE   64u
 #define HDR_SIZE             4u
 
@@ -855,6 +857,9 @@ static void cli_status(Transport *t)
     if (ptp_read(t, REG_ACCESS, b, 1) == 0)
         emit("TPM_ACCESS = 0x%02X", b[0]);
     else emit("TPM_ACCESS = (failed)");
+    /* bus obviously silent (all-FF reads)? bring up the bench checklist      */
+    if (miso_signature(t) == MISO_FLOAT_HIGH)
+        emit_bench_checklist(MISO_FLOAT_HIGH);
     if (ptp_read(t, REG_STS, b, 4) == 0) {
         sts = (unsigned long)b[0] | ((unsigned long)b[1] << 8) | ((unsigned long)b[2] << 16)
             | ((unsigned long)b[3] << 24);
@@ -882,7 +887,11 @@ static int cli_caps(Transport *t, Engine *e)
     if (!(n = build_getcap_fwver(cmd, sizeof(cmd)))) { emit("build failed"); return 1; }
     rc = 0;
     if (eng_send_command(e, cmd, n, rsp, &rspl, sizeof(rsp))) return 1;
-    if (rspl < 10u) { emit("short response (%u)", rspl); return 1; }
+    if (rspl < 10u) {
+        emit("short response (%u)", rspl);
+        emit_bench_checklist(miso_signature(t));
+        return 1;
+    }
     rc = rsp_rc(rsp);
     emit("TPM_RC = 0x%08lX", rc);
     if (rc == RC_SUCCESS && rspl >= 27u) {
@@ -1129,7 +1138,7 @@ static LRESULT CALLBACK main_wndproc(HWND h, UINT m, WPARAM wp, LPARAM lp)
 
         /* NOW the log control exists - bind it and greet */
         g_logbox = GetDlgItem(h, IDC_LOGB);
-        emit("st33tpmtool ready. Pick a backend below and press the buttons:");
+        emit("st33tpmtool v" APP_VERSION " ready. Pick a backend below and press the buttons:");
         emit("  * 'Demo: run simulator instead' - rehearse with no hardware");
         emit("  * 'Open' - attach the CH341A and use Probe/Status/Caps.");
         return 0;
@@ -1252,7 +1261,7 @@ static void setup_logging(void)
     if (slash) *(slash + 1) = 0;
     strcat(path, "st33tpmtool.log");
     g_logfile = fopen(path, "a");
-    if (g_logfile) fprintf(g_logfile, "\n===== st33tpmtool on %s ====\n", __DATE__ " " __TIME__);
+    if (g_logfile) fprintf(g_logfile, "\n===== st33tpmtool v" APP_VERSION " on %s ====\n", __DATE__ " " __TIME__);
 }
 
 int winmain_gui(HINSTANCE hI, int nShow);
@@ -1267,6 +1276,7 @@ int WINAPI WinMain(HINSTANCE hI, HINSTANCE hP, LPSTR cl, int nShow)
     int nargc = 0;
 
     setup_logging();
+    emit("st33tpmtool v" APP_VERSION " - direct TPM field-update tool (TCG PTP over SPI)");
 
     /* crude argv from the raw command line */
     {
