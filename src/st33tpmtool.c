@@ -41,7 +41,7 @@
 #include <stdint.h>
 
 /* --------------------------------------------------------------- constants */
-#define APP_VERSION         "1.0.7"
+#define APP_VERSION         "1.0.8"
 
 #define MAX_SPI_FRAMESIZE   64u
 #define HDR_SIZE             4u
@@ -925,6 +925,12 @@ static void emit_bench_checklist(int miso)
     emit("      the standby rail is dead unless your bench supply feeds it");
     emit("   c) continuity: U32 pin 24 (chip SO) -> CH341A MISO; the chip side");
     emit("      of RE133 (= U32 pin 20) -> CH341A CS0");
+    emit("   d) U32 pin 17 = PCH_PLTRST#_EC, an ACTIVE-LOW platform reset line.");
+    emit("      With the laptop unpowered it asserts and holds the whole TPM");
+    emit("      in reset - its SPI pins go high-impedance and every bus read");
+    emit("      returns 0xFF. Do NOT trust wiring checks until pin 17 reads");
+    emit("      ~3.3 V: drive it HIGH from your bench supply via ~1 kOhm");
+    emit("      resistor, applying power first and releasing RST last.");
     emit("");
 }
 
