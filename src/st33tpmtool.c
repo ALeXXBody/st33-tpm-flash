@@ -41,7 +41,7 @@
 #include <stdint.h>
 
 /* --------------------------------------------------------------- constants */
-#define APP_VERSION         "1.0.8"
+#define APP_VERSION         "1.0.9"
 
 #define MAX_SPI_FRAMESIZE   64u
 #define HDR_SIZE             4u
@@ -183,6 +183,10 @@ typedef struct {
     unsigned      cs;
     unsigned char scratch[HDR_SIZE + MAX_SPI_FRAMESIZE];
 } Ch341;
+
+/* set for real-HW transports so the probe can sweep CH341 SPI clock modes
+ * BEFORE you start re-soldering (see probe_sweep())                        */
+static Ch341 *g_ch = NULL;
 
 #define CH341_MODE_DEFAULT 0x81u
 #define CH341_CS_MASK      0x80u
@@ -790,6 +794,36 @@ static int probe_chip(Transport *t, unsigned *vid_out, unsigned *did_out, unsign
     return 0;
 }
 
+/* SPI clock-mode sweep: if the chip ignores our headers in the default CH341
+ * mode, try the remaining CH341 SPI modes before blaming the wiring. Why:
+ * TCG PTP SPI runs SPI mode 3 (CPOL=1, CPHA=1); CH341 mode constants map to
+ * the four CPOL/CPHA combinations and the D4/E4 chips can be picky. This is
+ * read-only probing, no writes, no risk to the chip.                        */
+static int probe_sweep(Transport *t, unsigned *vid_out, unsigned *did_out, unsigned *rid_out)
+{
+    static const unsigned modes[] = {0x81u, 0x80u, 0x82u, 0x83u, 0x84u, 0x85u, 0x86u, 0x87u};
+    unsigned i;
+    if (!g_ch || !g_ch->set_stream) return 1;       /* simulator: not needed */
+    emit("");
+    emit("chip is silent in CH341 SPI mode 0x%02X - sweeping the other clock modes...",
+         CH341_MODE_DEFAULT);
+    for (i = 0; i < sizeof(modes) / sizeof(modes[0]); ++i) {
+        g_ch->set_stream(g_ch->index, modes[i]);
+        g_ch->mode = modes[i];
+        if (probe_chip(t, vid_out, did_out, rid_out) == 0) {
+            emit("  CHIP ANSWERS with CH341 SPI mode 0x%02X:", modes[i]);
+            emit("    VID=0x%04X DID=0x%04X RID=0x%02X  (kept for this session)",
+                 *vid_out, *did_out, *rid_out);
+            return 0;
+        }
+        if (g_verbose) emit("  mode 0x%02X: no chip", modes[i]);
+    }
+    g_ch->set_stream(g_ch->index, CH341_MODE_DEFAULT);
+    g_ch->mode = CH341_MODE_DEFAULT;
+    emit("  none of the CH341 SPI modes produced a chip answer.");
+    return 1;
+}
+
 
 /* ============================================================================
  *  Driver diagnostics — enumerate present WCH USB devices and explain state
@@ -939,6 +973,7 @@ static void cli_info(Transport *t)
     unsigned vid = 0, did = 0, rid = 0;
     if (probe_chip(t, &vid, &did, &rid)) {
         emit("no chip response - bus floating / chip not addressed");
+        if (probe_sweep(t, &vid, &did, &rid) == 0) return;
         emit_bench_checklist(miso_signature(t));
         return;
     }
@@ -1193,6 +1228,7 @@ static void app_apply_backend(void)
         g_app.tport.close  = ch341_close;
         g_app.tport.ctx    = &g_app.ch341;
     }
+    g_ch = g_app.backend ? NULL : &g_app.ch341;
     g_app.eng.t = &g_app.tport;
 }
 
@@ -1325,6 +1361,13 @@ static LRESULT CALLBACK main_wndproc(HWND h, UINT m, WPARAM wp, LPARAM lp)
             if (probe_chip(&g_app.tport, &vid, &did, &rid)) {
                 SetDlgItemTextA(h, IDC_CHIPINFO, "(no chip)");
                 emit("probe: no chip response - bus floating / chip not addressed");
+                if (g_app.backend == 0 && probe_sweep(&g_app.tport, &vid, &did, &rid) == 0) {
+                    SetDlgItemTextA(h, IDC_CHIPINFO, vid_name(vid));
+                    emit("probe: VID=0x%04X DID=0x%04X RID=0x%02X (%s)",
+                         vid, did, rid, vid_name(vid));
+                } else {
+                    emit_bench_checklist(miso_signature(&g_app.tport));
+                }
             } else {
                 SetDlgItemTextA(h, IDC_CHIPINFO, vid_name(vid));
                 emit("probe: VID=0x%04X DID=0x%04X RID=0x%02X (%s)", vid, did, rid, vid_name(vid));
@@ -1524,6 +1567,7 @@ int WINAPI WinMain(HINSTANCE hI, HINSTANCE hP, LPSTR cl, int nShow)
             if (ch341_open(&g_app.ch341, 0)) {
                 app_apply_backend();
                 g_app.open_ok = 1;
+                g_ch = &g_app.ch341;
             } else {
                 g_gui = 0;
                 emit("ERROR: no CH341A adapter available. Retry with '--sim'.");
