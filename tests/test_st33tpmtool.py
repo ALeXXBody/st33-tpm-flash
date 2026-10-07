@@ -7,19 +7,8 @@ Run with the `.venv` interpreter:
 import subprocess
 import pytest
 
-import os
-import tempfile
-import pathlib
-
-EXE = os.environ.get("ST33TPMTOOL_EXE", str(pathlib.Path(__file__).resolve().parents[1] / "src" / "st33tpmtool.exe"))
-
-@pytest.fixture(scope="module")
-def fw(tmp_path_factory):
-    """A dummy firmware payload for dry-run tests (the real signed image is
-    intentionally NOT in the repository - extract your own from Dell's tool)."""
-    p = tmp_path_factory.mktemp("fw") / "fake_v1771.bin"
-    p.write_bytes(bytes(range(256)) * 40)   # ~10 KiB dummy payload
-    return str(p)
+EXE = "/home/truenas_admin/drop/st33tpmtool.exe"
+FW  = "/home/truenas_admin/drop/public/st33_v1771.bin"
 
 ENV = {
     "PATH": "/usr/bin:/bin:/usr/local/bin",
@@ -89,9 +78,9 @@ def test_status_fields_present():
     assert "dataAvail=" in out
 
 
-def test_fu_dry_run_does_not_transmit(fw):
+def test_fu_dry_run_does_not_transmit():
     """Dry-run: tool must validate the payload exist and refuse to transmit."""
-    rc, out = run("--sim", "healthy", "fu", "--file", fw, "--dry")
+    rc, out = run("--sim", "healthy", "fu", "--file", FW, "--dry")
     assert rc == 0
     assert "--dry: not transmitting." in out
 
@@ -100,3 +89,23 @@ def test_unknown_verb_is_rejected():
     rc, out = run("--sim", "nonsense")
     assert rc != 0
     assert "unknown command" in out
+
+
+def test_fu_drives_full_stream_against_sim():
+    """Field-update path end-to-end against the healthy simulator."""
+    rc, out = run("--sim", "healthy", "fu", "--file", FW)
+    assert rc == 0, out
+    assert "preflight: ST33 confirmed" in out
+    assert "stream complete" in out
+
+
+def test_fu_preflight_refused_on_dead_bus():
+    """No chip identified -> fu must refuse before transmitting."""
+    rc, out = run("--sim", "bus_dead", "fu", "--file", FW)
+    assert rc != 0
+    assert "refusing: no chip identified" in out
+
+
+def test_driver_verb_supported():
+    rc, out = run("--sim", "driver")
+    assert "USB devices from WCH" in out

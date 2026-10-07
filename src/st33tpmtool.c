@@ -9,9 +9,17 @@
  *               WRITE : { (n-1),      0xD4, addr16>>8, addr16 & 0xFF } + data
  *               n <= 64 bytes data phase per CS assertion (FIFO auto-advances)
  *
- * Commands used:
- *   TPM2_GetCapability(FIRMWARE_VERSION_1)   CC 0x0000017B
- *   TPM2_FieldUpgradeData(UINT16 len, bytes) CC 0x0000019E
+ *   READ  : { 0x80|(n-1), 0xD4, addr16>>8, addr16 & 0xFF } header, wait-state
+ *           polls (bit0=0), 'ready' token (bit0=1), then the data phase.
+ *   WRITE : same flow-control - the TPM may hold MISO low (bit0=0) after the
+ *           header for write transactions too; data is only clocked after
+ *           ready (kernel tpm_tis_spi_transfer_full does this for both
+ *           directions, with the data phase in its own CS assertion).
+ *
+ * Commands used (codes per TPM 2.0 spec Part 2; cross-checked against
+ * tpm2-tss tss2_tpm2_types.h during the v1.0.7 audit):
+ *   TPM2_GetCapability(FIRMWARE_VERSION_1)   CC 0x0000017A
+ *   TPM2_FieldUpgradeData(UINT16 len, bytes) CC 0x00000141
  *
  * A built-in simulator mimics ST33 behaviour, including the exact "FU mode"
  * failure seen on the affected laptop, so you can test without hardware.
@@ -33,41 +41,52 @@
 #include <stdint.h>
 
 /* --------------------------------------------------------------- constants */
-#define APP_VERSION         "1.0.6"
+#define APP_VERSION         "1.0.7"
 
 #define MAX_SPI_FRAMESIZE   64u
 #define HDR_SIZE             4u
 
+/* Register addresses (Linux include/linux/tpm_ptp.h - the v1.0.7 audit found
+ * INT_VECTOR/INT_STATUS/INTF_CAP all one slot off in earlier versions). */
 #define REG_ACCESS      0x0000u
-#define REG_INT_VECTOR  0x0004u
 #define REG_INT_ENABLE  0x0008u
-#define REG_INT_STATUS  0x000Cu
-#define REG_INTF_CAP    0x0010u
+#define REG_INT_VECTOR  0x000Cu
+#define REG_INT_STATUS  0x0010u
+#define REG_INTF_CAP    0x0014u
 #define REG_STS         0x0018u
 #define REG_DATA_FIFO   0x0024u
 #define REG_DID_VID     0x0F00u
 #define REG_RID         0x0F04u
 
-#define ACCESS_ACTIVE       0x02u
-#define ACCESS_REQ_USE      0x08u
-#define ACCESS_RELEASE      0x20u
+/* TPM_ACCESS bits (Linux tpm_ptp.h enum tis_access) */
+#define ACCESS_VALID        0x80u   /* (R) tpmRegValidSts */
+#define ACCESS_ACTIVE       0x20u   /* (R) activeLocality */
+#define ACCESS_RELEASE      0x20u   /* (W) relinquishLocality */
+#define ACCESS_REQ_USE      0x02u   /* (W) requestUse */
 
 #define STS_VALID       0x80u
 #define STS_DATA_AVAIL  0x10u
 #define STS_GO          0x20u
 #define STS_CMD_READY   0x40u
 
-#define CC_GET_CAPABILITY        0x0000017Bul
-#define CC_FIELD_UPGRADE_DATA    0x0000019Eul
+#define CC_GET_CAPABILITY        0x0000017Aul
+#define CC_FIELD_UPGRADE_DATA    0x00000141ul
 #define CAP_TPM_PROPERTIES       0x00000006ul
-#define PT_FIRMWARE_VERSION_1    0x00000106ul
+#define PT_FIRMWARE_VERSION_1    0x0000010Bul   /* TPM2_PT_FIXED(0x100) + 11 */
+#define PT_INPUT_BUFFER          0x0000010Dul   /* TPM2_PT_FIXED + 13 */
 #define ST_NO_SESSIONS           0x8001u
 #define RC_SUCCESS               0x00000000ul
+#define TPM_RETRY                50u
 
 #define VID_STMICRO 0x104Au
 #define VID_NUVOTON 0x1050u
 #define VID_ATMEL   0x15D1u
 #define VID_INTEL   0x8086u
+
+/* forward declarations used by engine/CLI code before their definitions */
+static HWND g_hwnd = NULL;              /* GUI main window (NULL in CLI mode) */
+static void ui_pump(void);
+static unsigned long rsp_rc(const unsigned char *rsp);
 
 static const char *vid_name(unsigned vid)
 {
@@ -119,12 +138,21 @@ static void emit(const char *fmt, ...)
 static void dump_hex(const char *tag, const unsigned char *b, unsigned n)
 {
     if (!g_verbose) return;
-    char buf[256];
-    int  off = _snprintf(buf, sizeof(buf) - 1, "%s (%u):", tag, n);
-    for (unsigned i = 0; i < n && off > 0 && off < (int)sizeof(buf) - 4; ++i)
-        off += _snprintf(buf + off, sizeof(buf) - (size_t)off - 1, "%s%02X", (i % 8 == 0) ? " " : "", b[i]);
-    _snprintf(buf + off, sizeof(buf) - (size_t)off - 1, " ...");
-    log_line(buf);
+    {
+        char buf[256];
+        int  off = snprintf(buf, sizeof(buf), "%s (%u):", tag, n);
+        unsigned i;
+        if (off < 0) return;
+        for (i = 0; i < n && off < (int)sizeof(buf) - 5; ++i) {
+            int r = snprintf(buf + off, sizeof(buf) - (size_t)off, "%s%02X",
+                             (i % 8 == 0) ? " " : "", b[i]);
+            if (r < 0) break;
+            off += r;
+        }
+        if (off >= (int)sizeof(buf)) off = (int)sizeof(buf) - 1;
+        buf[off] = 0;
+        log_line(buf);
+    }
 }
 
 /* ------------------------------------------------------------- transport */
@@ -333,6 +361,10 @@ typedef struct {
     unsigned      fw_version;
     unsigned char rid;
     unsigned      did;
+    unsigned      cur_addr;    /* address from the last header phase            */
+    int           cur_is_read; /* direction of the current transaction         */
+    unsigned      waits_left;  /* simulated wait-state bytes still pending     */
+    int           phase;       /* 0 idle, 1 after header, 2 read-token seen     */
 } Sim;
 
 static void sim_fill_response(Sim *s, const unsigned char *cmd, unsigned cmdlen)
@@ -400,87 +432,114 @@ static void sim_run(Sim *s, unsigned char *buf, unsigned n)
 {
     int    is_read = (buf[0] & 0x80) != 0;
     unsigned addr16 = ((unsigned)buf[2] << 8) | buf[3];
-    unsigned flow = 1;
 
     if (s->mode == SIM_MODE_BUS_DEAD) { memset(buf, 0, n); return; }
 
-    if (is_read) {
-        unsigned plen = (buf[0] & 0x3F) + 1;
-        unsigned char payload[MAX_SPI_FRAMESIZE];
-        unsigned pos, k;
-        memset(payload, 0, sizeof(payload));
-
-        if (addr16 == REG_DID_VID) {
-            /* bytes: DID hi, DID lo, VID hi, VID lo (BE, 4 bytes) */
-            /* DID_VID register (TIS): DID little-endian in bytes 0..1, VID LE in 2..3 */
-            payload[0] = (unsigned char)(s->did & 0xFF);
-            payload[1] = (unsigned char)((s->did >> 8) & 0xFF);
-            payload[2] = (unsigned char)(VID_STMICRO & 0xFF);
-            payload[3] = (unsigned char)((VID_STMICRO >> 8) & 0xFF);
-            flow = 2;
-        } else if (addr16 == REG_RID) {
-            payload[0] = s->rid;
-            flow = 1;
-        } else if (addr16 == REG_INTF_CAP) {
-            unsigned v = 0x00000015u;
-            payload[0] = (unsigned char)((v >> 24) & 0xFF);
-            payload[1] = (unsigned char)((v >> 16) & 0xFF);
-            payload[2] = (unsigned char)((v >> 8) & 0xFF);
-            payload[3] = (unsigned char)(v & 0xFF);
-            flow = 1;
-        } else if (addr16 == REG_STS) {
-            payload[0] = (unsigned char)(s->sts & 0xFF);
-            payload[1] = 0x40; payload[2] = 0x00;   /* burst = 64 */
-            payload[3] = (unsigned char)((s->sts & STS_DATA_AVAIL) ? 1 : 0);
-            flow = 2;
-        } else if (addr16 == REG_ACCESS) {
-            payload[0] = (unsigned char)(s->access & 0xFF);
-            flow = 1;
-        } else if (addr16 == REG_DATA_FIFO) {
-            unsigned take = s->fifo_out_len < plen ? s->fifo_out_len : plen;
-            memset(payload, 0, plen);
-            memcpy(payload, s->fifo_out, take);
-            memmove(s->fifo_out, s->fifo_out + take, s->fifo_out_len - take);
-            s->fifo_out_len -= take;
-            if (!s->fifo_out_len) s->sts &= ~STS_DATA_AVAIL;
-            flow = 1;
-        }
-
-        memset(buf, 0, n);
-        for (k = 0; k < flow; ++k) buf[HDR_SIZE + k] = 0x00;
-        buf[HDR_SIZE + flow] = 0x01;                    /* ready token */
-        pos = HDR_SIZE + flow + 1;
-        for (k = 0; k < plen && pos < n; ++k, ++pos) buf[pos] = payload[k];
+    /* header phase (4 bytes, full duplex): bit0 of the last header byte
+     * answers whether the chip is ready or waiting.                          */
+    if (s->phase == 0 && n == HDR_SIZE) {
+        s->cur_addr    = addr16;
+        s->cur_is_read = is_read;
+        s->waits_left  = is_read ? 2u : 0u;   /* reads wait, writes answer at once */
+        s->phase       = 1;
+        memset(buf, 0, HDR_SIZE);
+        if (!s->waits_left) buf[3] = 0x01u;   /* bit0 = ready, no wait state */
+        return;
+    }
+    if (s->phase == 1 && s->cur_is_read && n == 1) {   /* flow-control poll */
+        if (s->waits_left) { s->waits_left--; buf[0] = 0x00u; return; }
+        buf[0] = 0x01u;                       /* the 'ready' token byte     */
+        s->phase = 2;
         return;
     }
 
-    /* ---- write ---- */
+    /* ---- data phase (or a raw bulk frame like miso_signature) ------------- */
     {
-        unsigned dlen = (buf[0] & 0x3F) + 1;
-        if (addr16 == REG_ACCESS) {
-            unsigned char wr = dlen ? buf[HDR_SIZE] : 0;
-            if (wr & ACCESS_REQ_USE) s->access |= ACCESS_ACTIVE;
-            else if (wr & ACCESS_RELEASE) s->access &= ~ACCESS_ACTIVE;
-        } else if (addr16 == REG_STS) {
-            unsigned char wr = dlen ? buf[HDR_SIZE] : 0;
-            if (wr & STS_CMD_READY) {
-                s->sts = STS_VALID | STS_CMD_READY;
-                s->fifo_in_len  = 0;
-                s->fifo_out_len = 0;
-            } else if (wr & STS_GO) {
-                emit("   [sim] processing %u-byte command ...", s->fifo_in_len);
-                sim_fill_response(s, s->fifo_in, s->fifo_in_len);
-                s->fifo_in_len = 0;
-                s->sts = s->fifo_out_len ? (STS_VALID | STS_DATA_AVAIL)
-                                         : (STS_VALID | STS_CMD_READY);
+        int rd = (s->phase != 0) ? s->cur_is_read : is_read;
+        s->phase = 0;
+
+        if (rd) {
+            unsigned char payload[MAX_SPI_FRAMESIZE];
+            unsigned plen = n;
+            memset(payload, 0, sizeof(payload));
+            switch (s->cur_addr) {
+            case REG_DID_VID:
+                /* TPM_DID_VID is a u32 little-endian register; the VID lives in
+                 * the low 16 bits (wire bytes 0..1) and the DID in the high 16
+                 * bits (wire bytes 2..3) - Linux tpm_tis_core.c:
+                 *   vendor_id = did_vid; device_id = did_vid >> 16;             */
+                payload[0] = (unsigned char)(VID_STMICRO & 0xFF);
+                payload[1] = (unsigned char)((VID_STMICRO >> 8) & 0xFF);
+                payload[2] = (unsigned char)(s->did & 0xFF);
+                payload[3] = (unsigned char)((s->did >> 8) & 0xFF);
+                break;
+            case REG_RID:
+                payload[0] = s->rid;
+                break;
+            case REG_INTF_CAP:
+                /* TPM_INTF_CAPS (u32 LE); bit pattern per TCG tis_int_flags      */
+                payload[0] = 0x05u;   /* DATA_AVAIL_INT | STS_VALID_INT          */
+                payload[1] = 0x01u;   /* BURST_COUNT_STATIC (0x100)              */
+                break;
+            case REG_STS:
+                payload[0] = (unsigned char)(s->sts & 0xFF);
+                payload[1] = 0x40u; payload[2] = 0x00u;   /* burstCount = 64 LE */
+                break;
+            case REG_ACCESS:
+                payload[0] = (unsigned char)(s->access & 0xFF);
+                break;
+            case REG_DATA_FIFO: {
+                unsigned take = s->fifo_out_len < plen ? s->fifo_out_len : plen;
+                memcpy(payload, s->fifo_out, take);
+                memmove(s->fifo_out, s->fifo_out + take, s->fifo_out_len - take);
+                s->fifo_out_len -= take;
+                if (!s->fifo_out_len) s->sts &= ~STS_DATA_AVAIL;
+                break;
             }
-        } else if (addr16 == REG_DATA_FIFO) {
-            if (dlen && s->fifo_in_len + dlen <= sizeof(s->fifo_in)) {
-                memcpy(s->fifo_in + s->fifo_in_len, buf + HDR_SIZE, dlen);
-                s->fifo_in_len += dlen;
+            default:
+                memset(payload, 0, plen);
+                break;
             }
+            memcpy(buf, payload, plen);
+            return;
         }
-        memset(buf, 0, n);
+
+        /* ---- write data --------------------------------------------------- */
+        {
+            unsigned dlen = n;
+            switch (s->cur_addr) {
+            case REG_ACCESS: {
+                unsigned char wr = dlen ? buf[0] : 0;
+                if (wr & ACCESS_REQ_USE)      s->access |= (ACCESS_ACTIVE | ACCESS_VALID);
+                else if (wr & ACCESS_RELEASE) s->access &= ~ACCESS_ACTIVE;
+                break;
+            }
+            case REG_STS: {
+                unsigned char wr = dlen ? buf[0] : 0;
+                if (wr & STS_CMD_READY) {
+                    s->sts = STS_VALID | STS_CMD_READY;
+                    s->fifo_in_len  = 0;
+                    s->fifo_out_len = 0;
+                } else if (wr & STS_GO) {
+                    emit("   [sim] processing %u-byte command ...", s->fifo_in_len);
+                    sim_fill_response(s, s->fifo_in, s->fifo_in_len);
+                    s->fifo_in_len = 0;
+                    s->sts = s->fifo_out_len ? (STS_VALID | STS_DATA_AVAIL)
+                                             : (STS_VALID | STS_CMD_READY);
+                }
+                break;
+            }
+            case REG_DATA_FIFO:
+                if (s->fifo_in_len + dlen <= sizeof(s->fifo_in)) {
+                    memcpy(s->fifo_in + s->fifo_in_len, buf, dlen);
+                    s->fifo_in_len += dlen;
+                }
+                break;
+            default:
+                break;
+            }
+            memset(buf, 0, n);
+        }
     }
 }
 
@@ -490,57 +549,60 @@ static int sim_stream(unsigned length, unsigned char *buf, void *ctx)
 static void sim_close(void *ctx) { (void)ctx; }
 
 /* --------------------------------------------------------- PTP SPI engine */
+/* Kernel-exact transaction: header (own CS), one-byte wait polls (bit0 of the
+ * received byte tells ready), then the data phase in its own CS assertion.   */
+static int ptp_flow_wait(Transport *t, unsigned char *sbuf)
+{
+    unsigned retry;
+    if (sbuf[3] & 0x01u) return 0;          /* ready already during header   */
+    for (retry = 0; retry < TPM_RETRY; ++retry) {
+        memset(sbuf, 0, HDR_SIZE);
+        if (!t->stream(1, sbuf, t->ctx)) return 1;
+        if (sbuf[0] & 0x01u) return 0;
+    }
+    return 1;                               /* chip never released the wait  */
+}
+
 static int ptp_read(Transport *t, unsigned addr16, unsigned char *out, unsigned n)
 {
-    unsigned attempt;
+    unsigned char sbuf[MAX_SPI_FRAMESIZE];
+
     if (n == 0u || n > MAX_SPI_FRAMESIZE) return 1;
-    for (attempt = 0; attempt < 5u; ++attempt) {
-        unsigned fillers = (unsigned)(8u << attempt);   /* 8,32,128,512... but cap at 200 */
-        if (fillers > 200u) fillers = 200u;
-        unsigned txlen = HDR_SIZE + fillers + n + 1u;
-        unsigned char *sbuf = (unsigned char *)calloc(txlen, 1);
-        if (!sbuf) return 1;
-        sbuf[0] = 0x80u | (unsigned char)((n - 1) & 0x3F);
-        sbuf[1] = 0xD4u;
-        sbuf[2] = (unsigned char)((addr16 >> 8) & 0xFF);
-        sbuf[3] = (unsigned char)(addr16 & 0xFF);
-        dump_hex("ptp_read tx", sbuf, txlen);
-        if (!t->stream(txlen, sbuf, t->ctx)) { free(sbuf); return 1; }
-        dump_hex("ptp_read rx", sbuf, txlen);
-        {
-            unsigned idx = HDR_SIZE, consumed = 0;
-            if (sbuf[3] & 0x01u) {
-                while (idx < txlen && consumed < n) out[consumed++] = sbuf[idx++];
-                free(sbuf);
-                if (consumed == n) return 0;
-                continue;
-            }
-            while (idx < txlen && !(sbuf[idx] & 0x01u)) idx++;
-            if (idx < txlen) {
-                idx++;
-                while (idx < txlen && consumed < n) out[consumed++] = sbuf[idx++];
-                free(sbuf);
-                if (consumed == n) return 0;
-                continue;
-            }
-            free(sbuf);
-        }
-    }
-    return 1;
+
+    sbuf[0] = 0x80u | (unsigned char)((n - 1) & 0x3F);
+    sbuf[1] = 0xD4u;
+    sbuf[2] = (unsigned char)((addr16 >> 8) & 0xFF);
+    sbuf[3] = (unsigned char)(addr16 & 0xFF);
+    dump_hex("ptp_read hdr", sbuf, HDR_SIZE);
+    if (!t->stream(HDR_SIZE, sbuf, t->ctx)) return 1;
+    dump_hex("ptp_read hdr rx", sbuf, HDR_SIZE);
+    if (ptp_flow_wait(t, sbuf)) return 1;
+
+    memset(sbuf, 0, sizeof(sbuf));
+    if (!t->stream(n, sbuf, t->ctx)) return 1;
+    dump_hex("ptp_read data rx", sbuf, n);
+    memcpy(out, sbuf, n);
+    return 0;
 }
 
 static int ptp_write(Transport *t, unsigned addr16, const unsigned char *data, unsigned n)
 {
-    unsigned char sbuf[HDR_SIZE + MAX_SPI_FRAMESIZE];
+    unsigned char sbuf[MAX_SPI_FRAMESIZE];
+
     if (n == 0u || n > MAX_SPI_FRAMESIZE) return 1;
-    memset(sbuf, 0, sizeof(sbuf));
+
     sbuf[0] = (unsigned char)((n - 1) & 0x3F);
     sbuf[1] = 0xD4u;
     sbuf[2] = (unsigned char)((addr16 >> 8) & 0xFF);
     sbuf[3] = (unsigned char)(addr16 & 0xFF);
-    if (data) memcpy(sbuf + HDR_SIZE, data, n);
-    dump_hex("ptp_write tx", sbuf, HDR_SIZE + n);
-    if (!t->stream(HDR_SIZE + n, sbuf, t->ctx)) return 1;
+    dump_hex("ptp_write hdr", sbuf, HDR_SIZE);
+    if (!t->stream(HDR_SIZE, sbuf, t->ctx)) return 1;
+    /* writes are flow-controlled too: never clock data before ready        */
+    if (ptp_flow_wait(t, sbuf)) return 1;
+
+    memcpy(sbuf, data, n);
+    dump_hex("ptp_write data", sbuf, n);
+    if (!t->stream(n, sbuf, t->ctx)) return 1;
     return 0;
 }
 
@@ -551,9 +613,12 @@ static int eng_acquire_locality(Engine *e, unsigned tries)
 {
     for (unsigned i = 0; i < tries; ++i) {
         unsigned char va;
-        if (ptp_write(e->t, REG_ACCESS, (const unsigned char *)"\x08", 1)) return 1;
+        /* kernel: tpm_tis_write8(TPM_ACCESS(l), TPM_ACCESS_REQUEST_USE=0x02) */
+        if (ptp_write(e->t, REG_ACCESS, (const unsigned char *)"\x02", 1)) return 1;
         if (ptp_read(e->t, REG_ACCESS, &va, 1)) return 1;
-        if (va & ACCESS_ACTIVE) return 0;
+        /* kernel check_locality: activeLocality|valid set, requestUse clear */
+        if ((va & (ACCESS_ACTIVE | ACCESS_VALID)) == (ACCESS_ACTIVE | ACCESS_VALID))
+            return 0;
         Sleep(5);
     }
     return 1;
@@ -610,7 +675,7 @@ static int eng_send_command(Engine *e, const unsigned char *cmd, unsigned cmdlen
         if (chunk > burst)           chunk = burst;
         if (chunk > MAX_SPI_FRAMESIZE) chunk = MAX_SPI_FRAMESIZE;
         if (ptp_write(e->t, REG_DATA_FIFO, cmd + off, chunk)) { eng_release_locality(e); return 1; }
-        emit("   fifo write %u B @%u/%u (burst=%u)", chunk, off, cmdlen, burst);
+        if (g_verbose) emit("   fifo write %u B @%u/%u (burst=%u)", chunk, off, cmdlen, burst);
         off += chunk;
         burst = eng_burst_count(e);
         if (!burst) { emit("  burstCount invalid (mid-write)"); eng_release_locality(e); return 1; }
@@ -660,16 +725,37 @@ static void put_be32(unsigned char *p, unsigned long v)
     p[3] = (unsigned char)(v & 0xFF);
 }
 
-static unsigned build_getcap_fwver(unsigned char *b, unsigned blen)
+static unsigned build_getcap(unsigned char *b, unsigned blen, unsigned long prop)
 {
     if (blen < 22u) return 0;
     put_be16(b, ST_NO_SESSIONS);
     put_be32(b + 2, 22u);
     put_be32(b + 6, CC_GET_CAPABILITY);
     put_be32(b + 10, CAP_TPM_PROPERTIES);
-    put_be32(b + 14, PT_FIRMWARE_VERSION_1);
+    put_be32(b + 14, prop);
     put_be32(b + 18, 1u);
     return 22u;
+}
+
+/* Generic GetCapability(TPM_PROPERTIES, prop) runner; returns the property
+ * value via *val_out on success (rc==TPM_RC_SUCCESS).                       */
+static int eng_get_prop(Engine *e, unsigned long prop, unsigned long *val_out)
+{
+    unsigned char cmd[32], rsp[512];
+    unsigned n, rspl = sizeof(rsp);
+    unsigned long rc;
+    if (val_out) *val_out = 0;
+    if (!(n = build_getcap(cmd, sizeof(cmd), prop))) return 1;
+    memset(rsp, 0, sizeof(rsp));
+    if (eng_send_command(e, cmd, n, rsp, &rspl, sizeof(rsp))) return 1;
+    if (rspl < 10u) return 1;
+    rc = rsp_rc(rsp);
+    if (rc != RC_SUCCESS) { emit("TPM refused: 0x%08lX", rc); return 1; }
+    if (rspl < 27u) return 1;
+    if (val_out)
+        *val_out = ((unsigned long)rsp[23] << 24) | ((unsigned long)rsp[24] << 16)
+                 | ((unsigned long)rsp[25] << 8)  |  (unsigned long)rsp[26];
+    return 0;
 }
 
 static unsigned long rsp_rc(const unsigned char *rsp)
@@ -698,8 +784,8 @@ static int probe_chip(Transport *t, unsigned *vid_out, unsigned *did_out, unsign
     if (all0 || all_FF) return 1;
     r = 0;
     (void)ptp_read(t, REG_RID, &r, 1);
-    *did_out = (unsigned)a[0] | ((unsigned)a[1] << 8);
-    *vid_out = (unsigned)a[2] | ((unsigned)a[3] << 8);
+    *vid_out = (unsigned)a[0] | ((unsigned)a[1] << 8);
+    *did_out = (unsigned)a[2] | ((unsigned)a[3] << 8);
     *rid_out = r;
     return 0;
 }
@@ -787,42 +873,46 @@ static int cli_driver(void)
 #define MISO_FLOAT_HIGH   1
 #define MISO_TIED_LOW     2
 #define MISO_ACTIVE       0
+#define MISO_NOBUS        3   /* transactions not clocking at all (adapter side) */
 
 static int miso_signature(Transport *t)
 {
-    size_t fillers = 40, n = 4;
-    unsigned char buf[4 + 260];
+    unsigned char sbuf[4 + 48];
     unsigned i;
-    int any_low = 0, any_high = 0;
+    int all_ff = 1, all_00 = 1;
 
-    memset(buf, 0, sizeof(buf));
-    buf[0] = 0x80u | ((unsigned char)(n - 1) & 0x3F);
-    buf[1] = 0xD4;
-    buf[2] = (unsigned char)((REG_DID_VID >> 8) & 0xFF);
-    buf[3] = (unsigned char)(REG_DID_VID & 0xFF);
-    (void)fillers;
-    /* one raw stream */
-    {
-        unsigned char *sbuf = (unsigned char *)calloc(4 + 48, 1);
-        if (!sbuf) return MISO_ACTIVE;
-        memcpy(sbuf, buf, 4);
-        if (!t->stream(4 + 48, sbuf, t->ctx)) { free(sbuf); return MISO_ACTIVE; }
-        dump_hex("miso frame", sbuf, 4 + 48);
-        for (i = 4; i < 4 + 48; ++i) {
-            if (sbuf[i] == 0x00) any_low = 1;
-            if (sbuf[i] == 0xFF) any_high = 1;
-        }
-        free(sbuf);
+    memset(sbuf, 0, sizeof(sbuf));
+    sbuf[0] = 0x80u | 0x03u;    /* raw 4-byte read frame at the bus level */
+    sbuf[1] = 0xD4u;
+    sbuf[2] = (unsigned char)((REG_DID_VID >> 8) & 0xFF);
+    sbuf[3] = (unsigned char)(REG_DID_VID & 0xFF);
+    if (!t->stream(sizeof(sbuf), sbuf, t->ctx)) return MISO_NOBUS;
+    dump_hex("miso frame", sbuf, sizeof(sbuf));
+    for (i = HDR_SIZE; i < sizeof(sbuf); ++i) {
+        if (sbuf[i] != 0xFFu) all_ff = 0;
+        if (sbuf[i] != 0x00u) all_00 = 0;
     }
-    if (any_high && !any_low) return MISO_FLOAT_HIGH;
-    if (any_low && !any_high) return MISO_TIED_LOW;
+    if (all_ff) return MISO_FLOAT_HIGH;
+    if (all_00) return MISO_TIED_LOW;
     return MISO_ACTIVE;
 }
 
+static int g_checklist_shown = 0;
+
 static void emit_bench_checklist(int miso)
 {
+    if (g_checklist_shown) return;      /* once per run is enough */
+    g_checklist_shown = 1;
     emit("");
-    emit("CHEAT-SHEET for this state:");
+    emit("BENCH CHECKLIST for this state:");
+    if (miso == MISO_NOBUS) {
+        emit("  transactions are not clocking at all - adapter/driver side:");
+        emit("   a) run: st33tpmtool.exe --cli driver   (enumerate WCH at USB)");
+        emit("   b) green power LED on the board? correct device index?");
+        emit("   c) DLL not found? try --dll <path>\\CH341DLL.dll");
+        emit("");
+        return;
+    }
     if (miso == MISO_FLOAT_HIGH)
         emit("  MISO reads 0xFF (floating high) - nobody drives the data line:");
     else if (miso == MISO_TIED_LOW)
@@ -872,11 +962,14 @@ static void cli_status(Transport *t)
              (unsigned)((sts & STS_GO) ? 1u : 0u));
     } else emit("TPM_STS = (failed)");
     if (ptp_read(t, REG_INTF_CAP, b, 4) == 0) {
-        unsigned long icap = (unsigned long)b[0] << 24 | (unsigned long)b[1] << 16
-                           | (unsigned long)b[2] << 8 | (unsigned long)b[3];
-        emit("TPM_INTF_CAP = 0x%08X   fifo=%u crb=%u",
-             (unsigned)icap, (unsigned)(icap & 1u), (unsigned)((icap >> 1) & 1u));
-    } else emit("TPM_INTF_CAP = (failed)");
+        unsigned long icap = (unsigned long)b[0] | ((unsigned long)b[1] << 8)
+                           | ((unsigned long)b[2] << 16) | ((unsigned long)b[3] << 24);
+        /* TPM_INTF_CAPS bit decode per Linux enum tis_int_flags           */
+        emit("TPM_INTF_CAPS = 0x%08X   dataAvailInt=%u stsValidInt=%u burstStatic=%u",
+             (unsigned)icap,
+             (unsigned)(icap & 1u), (unsigned)((icap >> 1) & 1u),
+             (unsigned)((icap >> 8) & 1u));
+    } else emit("TPM_INTF_CAPS = (failed)");
 }
 
 static int cli_caps(Transport *t, Engine *e)
@@ -884,7 +977,7 @@ static int cli_caps(Transport *t, Engine *e)
     unsigned char cmd[32], rsp[512];
     unsigned n, rspl = sizeof(rsp);
     unsigned long rc;
-    if (!(n = build_getcap_fwver(cmd, sizeof(cmd)))) { emit("build failed"); return 1; }
+    if (!(n = build_getcap(cmd, sizeof(cmd), PT_FIRMWARE_VERSION_1))) { emit("build failed"); return 1; }
     rc = 0;
     if (eng_send_command(e, cmd, n, rsp, &rspl, sizeof(rsp))) return 1;
     if (rspl < 10u) {
@@ -908,8 +1001,7 @@ static int cli_fu(Transport *t, Engine *e, const char *file, int dry)
     long total;
     unsigned char *fw, cmd[1100], rsp[512];
     unsigned off = 0, rcc = 0, n, rspl;
-    size_t chunk;
-    (void)t;
+    size_t chunk, chunkmax = 960u;
     fp = fopen(file, "rb");
     if (!fp) { emit("cannot open %s", file); return 1; }
     fseek(fp, 0, SEEK_END); total = ftell(fp); fseek(fp, 0, SEEK_SET);
@@ -921,12 +1013,36 @@ static int cli_fu(Transport *t, Engine *e, const char *file, int dry)
     emit("firmware: %s (%ld bytes)", file, total);
     if (dry) { emit("--dry: not transmitting."); free(fw); return 0; }
 
+    /* pre-flight: never start an irreversible update without a confirmed
+     * STMicroelectronics chip in front of us.                               */
+    {
+        unsigned vid = 0, did = 0, rid = 0;
+        if (probe_chip(t, &vid, &did, &rid)) {
+            emit("refusing: no chip identified (run info/status first)");
+            free(fw); return 1;
+        }
+        if (vid != VID_STMICRO) {
+            emit("refusing: chip is not STMicroelectronics (VID=0x%04X)", vid);
+            free(fw); return 1;
+        }
+        emit("preflight: ST33 confirmed (VID=0x%04X DID=0x%04X RID=0x%02X)", vid, did, rid);
+    }
+    /* clamp per-command chunk to what the chip advertises as input buffer  */
+    {
+        unsigned long ibuf = 0;
+        if (eng_get_prop(e, PT_INPUT_BUFFER, &ibuf) == 0 && ibuf > 40u && ibuf < 4096u
+            && (size_t)ibuf < chunkmax) {
+            chunkmax = (size_t)ibuf;
+            emit("chip input buffer = %lu -> chunk = %u", ibuf, (unsigned)chunkmax);
+        }
+    }
+
     while (off < (unsigned)total) {
-        chunk = 960u;
+        chunk = chunkmax;
         if (chunk > (unsigned)total - off) chunk = (unsigned)total - off;
         n = 12u + (unsigned)chunk;
         cmd[0] = 0x80u; cmd[1] = 0x01u;
-        cmd[6] = 0x9Eu; cmd[7] = 0x01u; cmd[8] = 0x00u; cmd[9] = 0x00u;
+        put_be32(cmd + 6, CC_FIELD_UPGRADE_DATA);
         cmd[10] = (unsigned char)((chunk >> 8) & 0xFF);
         cmd[11] = (unsigned char)(chunk & 0xFF);
         memcpy(cmd + 12, fw + off, chunk);
@@ -941,6 +1057,7 @@ static int cli_fu(Transport *t, Engine *e, const char *file, int dry)
         }
         rcc++;
         off += (unsigned)chunk;
+        if (g_hwnd) ui_pump();      /* keep the window responsive while flashing */
     }
     emit("stream complete: %u chunks, %u bytes", rcc, off);
     free(fw);
@@ -964,6 +1081,7 @@ static int cli_test(void)
         sim.did = 0x0001u;
         sim.rid = 0xA3u;
         sim.sts = STS_VALID;
+        sim.access = ACCESS_VALID;
         t.stream = sim_stream;
         t.close  = sim_close;
         t.ctx    = &sim;
@@ -1026,7 +1144,30 @@ static App g_app;
 static const char *g_dll_override = NULL;
 static unsigned g_sim_mode = SIM_MODE_HEALTHY;
 static int  g_gui_sim = 0;
-static HWND g_hwnd = NULL;
+static int  g_busy = 0;   /* a long operation (flash) is running */
+
+static void set_busy(HWND h, int busy)
+{
+    static const int ids[] = { IDC_OPEN, IDC_CLOSE, IDC_PROBE, IDC_STATUS,
+                               IDC_CAPS, IDC_BROWSE, IDC_DRYRUN, IDC_FLASH,
+                               IDC_SIMMODE };
+    unsigned i;
+    for (i = 0; i < sizeof(ids) / sizeof(ids[0]); ++i)
+        if (GetDlgItem(h, ids[i])) EnableWindow(GetDlgItem(h, ids[i]), !busy);
+    g_busy = busy;
+    UpdateWindow(h);
+}
+
+/* pump queued messages during a long flash so the window stays responsive */
+static void ui_pump(void)
+{
+    MSG msg;
+    if (!g_hwnd) return;
+    while (PeekMessageA(&msg, NULL, 0, 0, PM_REMOVE)) {
+        TranslateMessage(&msg);
+        DispatchMessageA(&msg);
+    }
+}
 
 static void app_apply_backend(void)
 {
@@ -1037,6 +1178,7 @@ static void app_apply_backend(void)
         g_app.sim.did = 0x0001u;
         g_app.sim.rid = 0xA3u;
         g_app.sim.sts = STS_VALID;
+        g_app.sim.access = ACCESS_VALID;
         g_app.tport.stream = sim_stream;
         g_app.tport.close  = sim_close;
         g_app.tport.ctx    = &g_app.sim;
@@ -1065,8 +1207,6 @@ static LRESULT CALLBACK main_wndproc(HWND h, UINT m, WPARAM wp, LPARAM lp)
         lf.lfHeight = -14;
         strcpy_s(lf.lfFaceName, sizeof(lf.lfFaceName), "MS Shell Dlg");
         g_fnt = CreateFontIndirectA(&lf);
-        if (g_gui_sim)
-            SendMessageA(GetDlgItem(h, IDC_SIMMODE), BM_SETCHECK, (WPARAM)BST_CHECKED, 0);
 
         GetClientRect(h, &r);
         (void)r;
@@ -1136,8 +1276,13 @@ static LRESULT CALLBACK main_wndproc(HWND h, UINT m, WPARAM wp, LPARAM lp)
         /* apply fonts */
         EnumChildWindows(h, setfont_proc, 0);
 
-        /* NOW the log control exists - bind it and greet */
+        /* NOW the log control exists - bind it, widen the text limit (the
+         * default EDIT cap is ~32 KiB and silently stops appending) and
+         * greet                                                              */
         g_logbox = GetDlgItem(h, IDC_LOGB);
+        SendMessageA(g_logbox, EM_LIMITTEXT, (WPARAM)0x7FFFFFFE, 0);
+        if (g_gui_sim)
+            SendMessageA(GetDlgItem(h, IDC_SIMMODE), BM_SETCHECK, (WPARAM)BST_CHECKED, 0);
         emit("st33tpmtool v" APP_VERSION " ready. Pick a backend below and press the buttons:");
         emit("  * 'Demo: run simulator instead' - rehearse with no hardware");
         emit("  * 'Open' - attach the CH341A and use Probe/Status/Caps.");
@@ -1157,13 +1302,14 @@ static LRESULT CALLBACK main_wndproc(HWND h, UINT m, WPARAM wp, LPARAM lp)
                 emit("simulator backend already active");
             } else {
                 char idx[12]; GetDlgItemTextA(h, IDC_DEVICEIDX, idx, sizeof(idx));
-                ch341_open_ext(&g_app.ch341, (unsigned)atoi(idx), NULL);
-                g_app.open_ok = 1;
+                g_app.open_ok = ch341_open_ext(&g_app.ch341,
+                                               (unsigned)atoi(idx), NULL) ? 1 : 0;
+                if (!g_app.open_ok) emit("open failed - see the reason logged above");
             }
             return 0;
 
         case IDC_CLOSE:
-            if (g_app.tport.close) g_app.tport.close(g_app.tport.ctx);
+            if (!g_app.backend) { if (g_app.tport.close) g_app.tport.close(g_app.tport.ctx); }
             g_app.open_ok = 0;
             emit("adapter closed");
             return 0;
@@ -1185,8 +1331,10 @@ static LRESULT CALLBACK main_wndproc(HWND h, UINT m, WPARAM wp, LPARAM lp)
             return 0;
 
         case IDC_CAPS:
+            set_busy(h, 1);
             emit("caps: TPM2_GetCapability(FIRMWARE_VERSION_1)...");
             cli_caps(&g_app.tport, &g_app.eng);
+            set_busy(h, 0);
             return 0;
 
         case IDC_BROWSE: {
@@ -1233,11 +1381,22 @@ static LRESULT CALLBACK main_wndproc(HWND h, UINT m, WPARAM wp, LPARAM lp)
                             "Proceed?",
                             "Confirm", MB_YESNO | MB_ICONWARNING) == IDYES)
             {
+                set_busy(h, 1);
                 cli_fu(&g_app.tport, &g_app.eng, fname, 0);
+                set_busy(h, 0);
             }
             return 0;
         }
         }
+        return 0;
+
+    case WM_CLOSE:
+        /* a half-finished firmware update is worse than an unusable window */
+        if (g_busy) {
+            emit("flash in progress - refusing to close the window; wait for it.");
+            return 0;
+        }
+        DestroyWindow(h);
         return 0;
 
     case WM_CTLCOLORBTN:
@@ -1261,6 +1420,12 @@ static void setup_logging(void)
     if (slash) *(slash + 1) = 0;
     strcat(path, "st33tpmtool.log");
     g_logfile = fopen(path, "a");
+    if (!g_logfile) {
+        /* exe folder may be unwritable - fall back to the user temp folder */
+        GetTempPathA(sizeof(path) - strlen("st33tpmtool.log") - 1, path);
+        strcat(path, "st33tpmtool.log");
+        g_logfile = fopen(path, "a");
+    }
     if (g_logfile) fprintf(g_logfile, "\n===== st33tpmtool v" APP_VERSION " on %s ====\n", __DATE__ " " __TIME__);
 }
 
@@ -1278,18 +1443,24 @@ int WINAPI WinMain(HINSTANCE hI, HINSTANCE hP, LPSTR cl, int nShow)
     setup_logging();
     emit("st33tpmtool v" APP_VERSION " - direct TPM field-update tool (TCG PTP over SPI)");
 
-    /* crude argv from the raw command line */
+    /* argv from the raw command line; whitespace-separated, quotes are
+     * transparent (dropped) so "--file C:\path with spaces\fw.bin" works. */
     {
         char *s;
         (void)cl;
         s = GetCommandLineA();
-        /* very simple split */
         while (*s && nargc < 15) {
+            char *w;
             while (*s == ' ' || *s == '\t') ++s;
             if (!*s) break;
-            argv[nargc++] = s;
-            while (*s && *s != ' ' && *s != '\t') ++s;
-            if (*s) *s++ = 0;
+            argv[nargc++] = w = s;
+            while (*s) {
+                if (*s == '"') { ++s; continue; }      /* drop quote chars     */
+                if (*s == ' ' || *s == '\t') break;
+                *w++ = *s++;
+            }
+            if (*s) *s++ = 0;      /* advance past the separator BEFORE NUL-ing it */
+            *w = 0;
         }
     }
 
@@ -1331,7 +1502,7 @@ int WINAPI WinMain(HINSTANCE hI, HINSTANCE hP, LPSTR cl, int nShow)
         for (int i = 1; i < nargc; ++i) {
             if (!strcmp(argv[i], "info") || !strcmp(argv[i], "status") ||
                 !strcmp(argv[i], "caps")  || !strcmp(argv[i], "fu")    ||
-                !strcmp(argv[i], "test")) { verb_index = i; cmd = argv[i]; break; }
+                !strcmp(argv[i], "test")  || !strcmp(argv[i], "driver")) { verb_index = i; cmd = argv[i]; break; }
         }
         for (int i = verb_index + 1; i < nargc; ++i) {
             if (!strcmp(argv[i], "--file") && i + 1 < nargc) file_arg = argv[++i];
