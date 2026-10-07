@@ -1,0 +1,5 @@
+st33tpmtool.log
+*.exe
+.venv/
+__pycache__/
+*.pyc
