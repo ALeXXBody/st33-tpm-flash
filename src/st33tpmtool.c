@@ -178,7 +178,15 @@ static int ch341_open(Ch341 *c, unsigned index)
     memset(c, 0, sizeof(*c));
     c->dll = LoadLibraryA("CH341DLL.dll");
     if (!c->dll) c->dll = LoadLibraryA("CH341DLL");
-    if (!c->dll) { emit("ERROR: CH341DLL.dll not found (WCH CH341SER package)."); return 0; }
+    if (!c->dll) {
+        emit("ERROR: CH341DLL.dll not found next to the app.");
+        emit("  1) If you have CH341A Pro installed on this PC, copy CH341DLL.dll");
+        emit("     from its install folder (e.g. C:\\Program Files\\CH341A Pro\\)");
+        emit("  2) Otherwise install the WCH CH341PAR driver package (that one");
+        emit("     exposes the SPI functions and includes CH341DLL.dll).");
+        emit("     NOTE: the CH341SER driver (COM port) alone is NOT enough.");
+        return 0;
+    }
     c->open        = (ch3_open_t)        GetProcAddress(c->dll, "CH341OpenDevice");
     c->close       = (ch3_close_t)       GetProcAddress(c->dll, "CH341CloseDevice");
     c->set_stream  = (ch3_set_stream_t)  GetProcAddress(c->dll, "CH341SetStream");
@@ -586,6 +594,81 @@ static int probe_chip(Transport *t, unsigned *vid_out, unsigned *did_out, unsign
     *rid_out = r;
     return 0;
 }
+
+
+/* ============================================================================
+ *  Driver diagnostics — enumerate present WCH USB devices and explain state
+ *  (works with no adapter attached: it just reports what Windows can see)
+ * ========================================================================== */
+#include <setupapi.h>
+
+static const GUID GUID_USB = {0x36fc9e60,0xc465,0x11cf,{0x80,0x56,0x44,0x45,0x53,0x54,0x00,0x00}};
+
+typedef struct { const char *name; const char *vid_pid; } ChDesc;
+static const ChDesc CH_TABLE[] = {
+    { "CH341A (SPI capable, the one the tool needs)", "VID_1A86&PID_5523" },
+    { "CH340/CH341 serial variant",                   "VID_1A86&PID_7523" },
+    { "CH341A serial interface exposure",             "VID_1A86&PID_55A4" },
+    { "CH347T (needs a different DLL, not supported yet)", "VID_1A86&PID_55DB" },
+    { "CH9326",                                       "VID_1A86&PID_0932" },
+};
+
+static int usb_has(const char *needle)
+{
+    int found = 0;
+    HDEVINFO h = SetupDiGetClassDevs(&GUID_USB, NULL, NULL, DIGCF_PRESENT);
+    if (h == INVALID_HANDLE_VALUE) {
+        emit("driver-info: cannot enumerate USB devices");
+        return 0;
+    }
+    SP_DEVINFO_DATA d;
+    unsigned idx = 0;
+    memset(&d, 0, sizeof(d));
+    d.cbSize = sizeof(d);
+    while (SetupDiEnumDeviceInfo(h, idx++, &d)) {
+        unsigned char buf[512];
+        if (SetupDiGetDeviceRegistryPropertyA(h, &d, SPDRP_HARDWAREID, NULL,
+                buf, sizeof(buf), NULL)) {
+            const char *id = (const char *)buf;
+            if (strstr(id, needle)) { found = 1; break; }
+        }
+    }
+    SetupDiDestroyDeviceInfoList(h);
+    return found;
+}
+
+static int cli_driver(void)
+{
+    int i;
+    int n = (int)(sizeof(CH_TABLE) / sizeof(CH_TABLE[0]));
+    int saw = 0;
+    emit("USB devices from WCH (VID 1A86) present right now:");
+    for (i = 0; i < n; ++i) {
+        if (usb_has(CH_TABLE[i].vid_pid)) {
+            emit("  %-8s : %s", CH_TABLE[i].vid_pid, CH_TABLE[i].name);
+            saw = 1;
+        }
+    }
+    if (!saw) {
+        emit("  (none)");
+        emit("");
+        emit("Board not detected at the USB level:");
+        emit("  - plugged in, cable good, green LED on?");
+        emit("  - Device Manager shows anything under 'USB controllers'?");
+        emit("  - if you see an unknown device, install the WCH driver package.");
+        return 2;
+    }
+    emit("");
+    emit("Interpretation:");
+    if (usb_has("VID_1A86&PID_5523"))
+        emit("  CH341A present: the SPI driver DLL is what we use.");
+    if (usb_has("VID_1A86&PID_55DB"))
+        emit("  CH347T present: your 'Pro' board is the high-speed variant - this");
+    emit("  tool's GR751DLL (CH341A) does NOT match it; you also need the");
+    emit("  CH347DLL.dll (support can be added). Ask if this applies to you.");
+    return 0;
+}
+
 
 /* ------------------------------------------------------------- CLI actions */
 static void cli_info(Transport *t)
@@ -1095,8 +1178,9 @@ int WINAPI WinMain(HINSTANCE hI, HINSTANCE hP, LPSTR cl, int nShow)
             return cli_fu(&g_app.tport, &g_app.eng, file_arg, dry_arg);
         }
         else if (!strcmp(cmd, "test"))     return cli_test();
+        else if (!strcmp(cmd, "driver"))   return cli_driver();
         else {
-            emit("unknown command (supported: info, status, caps, fu, test)");
+            emit("unknown command (supported: info, status, caps, fu, test, driver)");
             return 1;
         }
     }
