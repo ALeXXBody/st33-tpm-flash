@@ -131,6 +131,18 @@ pytest tests -q
   publicly documented Linux driver behaviour and ST's published datasheet
   (DB3421/DS14186).
 
+## Support
+
+<div align="center">
+
+### ☕ [Buy Me A Coffee — ALeXXBody](https://buymeacoffee.com/alexxbody)
+
+*All support goes into hardware parts and tokens for building more free tools for the community.*
+
+[![Buy Me A Coffee](https://img.shields.io/badge/Buy%20Me%20a%20Coffee-alexxbody-FFDD00?logo=buy-me-a-coffee&logoColor=black)](https://buymeacoffee.com/alexxbody)
+
+</div>
+
 ## License
 
 MIT — see [LICENSE](LICENSE).
